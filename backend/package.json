@@ -1,0 +1,38 @@
+{
+  "name": "roomconnect-backend",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "migrate": "node db/migrate.js",
+    "seed": "node db/seed.js",
+    "test": "jest",
+    "start:1": "set PORT=3001 && node src/server.js",
+    "start:2": "set PORT=3002 && node src/server.js",
+    "start:3": "set PORT=3003 && node src/server.js",
+    "start:all": "concurrently \"npm run start:1\" \"npm run start:2\" \"npm run start:3\""
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "aws-sdk": "^2.1693.0",
+    "axios": "^1.13.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "helmet": "^7.2.0",
+    "ioredis": "^5.9.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.1.4",
+    "multer": "^2.0.2",
+    "pg": "^8.17.1",
+    "redis": "^5.10.0",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "stripe": "^20.1.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "nodemon": "^3.0.2"
+  }
+}

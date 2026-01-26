@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    container_name: roomconnect-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: roomconnect
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: roomconnect_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  mongodb:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+      
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+
+volumes:
+  postgres_data:
+  mongo_data:

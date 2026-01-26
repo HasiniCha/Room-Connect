@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # RoomConnect
 
 RoomConnect is a marketplace-style property booking platform with a real-time chat system for tenants and landlords. The stack is a Node/Express backend, a React frontend, MongoDB for chat messages, PostgreSQL for relational data, Redis for caching, RabbitMQ for background work, and Socket.IO for real-time messaging.
@@ -89,3 +90,6 @@ See [backend/.env](backend/.env) for a full example.
 - The frontend is a standard Create React App project: use `npm start` in `frontend`.
 - To inspect RabbitMQ management UI, open http://localhost:15672 (default user/password in docker-compose shown in file).
 
+=======
+# Room-Connect
+>>>>>>> ff20a2ff0e1124d4e723497b8b05bd561ea0883e

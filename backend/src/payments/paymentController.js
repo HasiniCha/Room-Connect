@@ -30,7 +30,7 @@ exports.createPaymentIntent = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-r
+
 exports.webhookHandler = async (req, res) => {
   const sig = req.headers['stripe-signature'];
   

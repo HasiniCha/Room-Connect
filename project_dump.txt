@@ -1,0 +1,2409 @@
+﻿===== backend\.env =====
+# Server
+PORT=3001
+NODE_ENV=development
+FRONTEND_URL=http://localhost:3000
+
+# Database (Postgres in Docker)
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=roomconnect_db
+DB_USER=roomconnect
+DB_PASSWORD=secret
+
+# JWT
+JWT_SECRET=your_super_secret_key_change_this_in_production_min_32_chars
+
+# MongoDB
+MONGODB_URI=mongodb://localhost:27017/roomconnect
+
+# Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+
+# RabbitMQ - Use guest:guest OR create admin user (see above)
+RABBITMQ_URL=amqp://guest:guest@localhost:5672
+
+# Stripe
+STRIPE_SECRET_KEY=sk_test_XXXXXXXXXXXXXXXX
+
+===== backend\package.json =====
+{
+  "name": "roomconnect-backend",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "migrate": "node db/migrate.js",
+    "seed": "node db/seed.js",
+    "test": "jest",
+    "start:1": "set PORT=3001 && node src/server.js",
+    "start:2": "set PORT=3002 && node src/server.js",
+    "start:3": "set PORT=3003 && node src/server.js",
+    "start:all": "concurrently \"npm run start:1\" \"npm run start:2\" \"npm run start:3\""
+  },
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "aws-sdk": "^2.1693.0",
+    "axios": "^1.13.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "helmet": "^7.2.0",
+    "ioredis": "^5.9.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.1.4",
+    "multer": "^2.0.2",
+    "pg": "^8.17.1",
+    "redis": "^5.10.0",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "stripe": "^20.1.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "nodemon": "^3.0.2"
+  }
+}
+
+
+===== backend\src\app.js =====
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+require('dotenv').config();
+
+const app = express();
+
+
+app.use(helmet());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
+
+
+app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
+
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+
+app.use((req, res, next) => {
+  const port = process.env.PORT || '3001';
+  console.log(`[${port}] ${req.method} ${req.path}`);
+  next();
+});
+
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'Server is running',
+    port: process.env.PORT || 3001,
+    timestamp: new Date().toISOString()
+  });
+});
+
+
+app.get('/test-db', async (req, res) => {
+  try {
+    const pool = require('../db/postgres');
+    const result = await pool.query('SELECT NOW() as time, current_database() as db');
+    res.json({ 
+      success: true,
+      port: process.env.PORT || 3001,
+      database: result.rows[0]
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+
+const authRoutes = require('./routes/authRoutes');
+app.use('/api/auth', authRoutes);
+
+
+try {
+  const propertyRoutes = require('./routes/propertyRoutes');
+  app.use('/api/properties', propertyRoutes);
+} catch (error) {
+  console.log(' Property routes not loaded:', error.message);
+}
+try {
+  const chatRoutes = require('./routes/chatRoutes');
+  app.use('/api/chat', chatRoutes);
+  console.log('Chat routes loaded');
+} catch (error) {
+  console.log('Chat routes not loaded:', error.message);
+}
+try {
+  const bookingRoutes = require('./routes/bookingRoutes');
+  app.use('/api/bookings', bookingRoutes);
+} catch (error) {
+  console.log('Booking routes not loaded:', error.message);
+}
+
+try {
+  const paymentRoutes = require('./routes/paymentRoutes');
+  app.use('/api/payments', paymentRoutes);
+} catch (error) {
+  console.log('Payment routes not loaded:', error.message);
+}
+
+try {
+  const maintenanceRoutes = require('./routes/maintenanceRoutes');
+  app.use('/api/maintenance', maintenanceRoutes);
+} catch (error) {
+  console.log('Maintenance routes not loaded:', error.message);
+}
+try {
+  const chatRoutes = require('./routes/chatRoutes');
+  app.use('/api/chat', chatRoutes);
+} catch (error) {
+  console.log('Chat routes not loaded:', error.message);
+}
+
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err);
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error',
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+  });
+});
+
+module.exports = app;
+
+===== backend\src\server.js =====
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const socketio = require('socket.io');
+const pool = require('../db/postgres');
+const connectMongoDB = require('../db/mongodb');
+const { connectRedis } = require('./utils/redis');
+const { connect: connectRabbitMQ } = require('./queue/rabbitmq');
+const app = require('./app');
+const { authenticateSocket } = require('./middleware/socketAuth');
+const ChatMessage = require('./models/ChatMessage');
+
+const PORT = process.env.PORT || 3001;
+
+async function initializeConnections() {
+
+  try {
+    const result = await pool.query('SELECT NOW() as now');
+    console.log(` [Port ${PORT}] PostgreSQL connected at:`, result.rows[0].now);
+  } catch (error) {
+    console.error(`[Port ${PORT}] PostgreSQL connection failed:`, error.message);
+  }
+  
+
+  await connectMongoDB();
+  
+
+  connectRedis();
+  
+ 
+  await connectRabbitMQ();
+}
+
+const server = http.createServer(app);
+
+const io = socketio(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true
+  }
+});
+
+app.set('io', io);
+global.io = io;
+
+
+io.use(authenticateSocket);
+
+
+io.on('connection', (socket) => {
+  console.log(`[Port ${PORT}] User connected:`, socket.user.id);
+  
+
+  socket.join(`user:${socket.user.id}`);
+  
+
+  socket.on('join_chat', (roomId) => {
+    if (!roomId || roomId === 'undefined') {
+      console.error(`[Port ${PORT}] Invalid roomId:`, roomId);
+      socket.emit('error', { message: 'Invalid room ID' });
+      return;
+    }
+    
+    socket.join(`chat:${roomId}`);
+    console.log(`[Port ${PORT}] User ${socket.user.id} joined chat ${roomId}`);
+  });
+  
+
+  socket.on('send_message', async ({ roomId, message }) => {
+    try {
+      console.log(`[Port ${PORT}] Saving message from user ${socket.user.id} to room ${roomId}`);
+      
+      if (!roomId || roomId === 'undefined') {
+        throw new Error('Invalid room ID');
+      }
+      
+      if (!message || !message.trim()) {
+        throw new Error('Message cannot be empty');
+      }
+      
+     
+      const chatMessage = await ChatMessage.create({
+        roomId,
+        senderId: socket.user.id.toString(),
+        senderName: `${socket.user.firstName || 'User'} ${socket.user.lastName || ''}`.trim(),
+        message: message.trim(),
+        timestamp: new Date()
+      });
+      
+      console.log(`[Port ${PORT}] Message saved:`, chatMessage._id);
+      
+   
+      io.to(`chat:${roomId}`).emit('new_message', chatMessage);
+      
+    } catch (error) {
+      console.error(` [Port ${PORT}] Error saving message:`, error.message);
+      socket.emit('error', { message: 'Failed to send message: ' + error.message });
+    }
+  });
+  
+  socket.on('typing', (roomId) => {
+    if (!roomId || roomId === 'undefined') return;
+    
+    socket.to(`chat:${roomId}`).emit('user_typing', {
+      userId: socket.user.id,
+      username: socket.user.firstName || 'User'
+    });
+  });
+  
+  
+  socket.on('leave_chat', (roomId) => {
+    if (!roomId || roomId === 'undefined') return;
+    
+    socket.leave(`chat:${roomId}`);
+    console.log(` [Port ${PORT}] User ${socket.user.id} left chat ${roomId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(` [Port ${PORT}] User disconnected:`, socket.user.id);
+  });
+});
+
+initializeConnections().then(() => {
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+   
+  });
+});
+
+
+const gracefulShutdown = () => {
+  console.log('\nShutting down gracefully...');
+  server.close(() => {
+    console.log('HTTP server closed');
+    pool.end();
+    process.exit(0);
+  });
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+===== backend\db\mongodb.js =====
+
+const mongoose = require('mongoose');
+
+const chatMessageSchema = new mongoose.Schema({
+  roomId: {
+    type: String,
+    required: true,
+    index: true
+  },
+  senderId: {
+    type: String,
+    required: true,
+    index: true
+  },
+  senderName: {
+    type: String,
+    required: true
+  },
+  senderEmail: {
+    type: String,
+    default: ''
+  },
+  message: {
+    type: String,
+    required: true,
+    trim: true,
+    maxlength: 5000
+  },
+  messageType: {
+    type: String,
+    enum: ['text', 'image', 'file', 'system'],
+    default: 'text'
+  },
+  read: {
+    type: Boolean,
+    default: false
+  },
+  status: {
+    type: String,
+    enum: ['sent', 'delivered', 'read'],
+    default: 'sent'
+  },
+  timestamp: {
+    type: Date,
+    default: Date.now,
+    index: true
+  },
+  edited: {
+    type: Boolean,
+    default: false
+  },
+  editedAt: {
+    type: Date
+  },
+  deletedBy: [{
+    type: String
+  }]
+}, {
+  timestamps: true
+});
+
+
+chatMessageSchema.index({ roomId: 1, timestamp: -1 });
+chatMessageSchema.index({ senderId: 1, timestamp: -1 });
+
+chatMessageSchema.methods.toClientFormat = function() {
+  return {
+    _id: this._id,
+    roomId: this.roomId,
+    senderId: this.senderId,
+    senderName: this.senderName,
+    message: this.message,
+    messageType: this.messageType,
+    read: this.read,
+    timestamp: this.timestamp,
+    edited: this.edited
+  };
+};
+
+const ChatMessage = mongoose.model('ChatMessage', chatMessageSchema);
+
+module.exports = ChatMessage;
+
+===== backend\db\postgres.js =====
+const { Pool } = require('pg');
+require('dotenv').config();
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'roomconnect',
+  user: process.env.DB_USER || 'admin',
+  password: process.env.DB_PASSWORD || 'admin123',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+
+pool.on('connect', () => {
+  console.log('âœ… Connected to PostgreSQL database');
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on PostgreSQL client', err);
+  process.exit(-1);
+});
+
+
+module.exports = pool;
+
+===== backend\db\schema.sql =====
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) CHECK (role IN ('landlord', 'tenant')) NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    phone VARCHAR(20),
+    verified BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE properties (
+    id SERIAL PRIMARY KEY,
+    landlord_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    address TEXT NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    monthly_rent DECIMAL(10,2) NOT NULL,
+    deposit_amount DECIMAL(10,2) NOT NULL,
+    rooms INTEGER NOT NULL,
+    status VARCHAR(20) DEFAULT 'available',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE bookings (
+    id SERIAL PRIMARY KEY,
+    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
+    tenant_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    monthly_rent DECIMAL(10,2) NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    stripe_payment_id VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE maintenance_requests (
+    id SERIAL PRIMARY KEY,
+    property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
+    tenant_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    priority VARCHAR(20) DEFAULT 'medium',
+    status VARCHAR(20) DEFAULT 'open',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_properties_city ON properties(city);
+CREATE INDEX idx_bookings_tenant ON bookings(tenant_id);
+CREATE INDEX idx_maintenance_status ON maintenance_requests(status);
+
+===== backend\db\migrate.js =====
+
+===== backend\src\auth\authController.js =====
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const pool = require('../../db/postgres');
+
+
+exports.register = async (req, res) => {
+  try {
+    const { email, password, role, firstName, lastName, phone } = req.body;
+    
+
+    if (!email || !password || !role || !firstName || !lastName) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    
+
+    const existingUser = await pool.query(
+      'SELECT id FROM users WHERE email = $1',
+      [email]
+    );
+    
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+    
+
+    if (!['landlord', 'tenant'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role. Must be landlord or tenant' });
+    }
+    
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    
+
+    const result = await pool.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, phone) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
+       RETURNING id, email, role, first_name, last_name, phone, verified, created_at`,
+      [email, passwordHash, role, firstName, lastName, phone || null]
+    );
+    
+    const user = result.rows[0];
+    
+
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    res.status(201).json({ 
+      message: 'Registration successful',
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        phone: user.phone,
+        verified: user.verified
+      },
+      token 
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed. Please try again.' });
+  }
+};
+
+
+exports.login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+ 
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+
+    const result = await pool.query(
+      'SELECT * FROM users WHERE email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    
+
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        role: user.role 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    
+    res.json({ 
+      message: 'Login successful',
+      user: { 
+        id: user.id, 
+        email: user.email, 
+        role: user.role, 
+        firstName: user.first_name,
+        lastName: user.last_name,
+        phone: user.phone,
+        verified: user.verified
+      },
+      token 
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
+};
+
+exports.getProfile = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const result = await pool.query(
+      `SELECT id, email, role, first_name, last_name, phone, verified, created_at 
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    res.json({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      phone: user.phone,
+      verified: user.verified,
+      createdAt: user.created_at
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+};
+
+
+exports.logout = async (req, res) => {
+  res.json({ message: 'Logout successful' });
+};
+
+===== backend\src\booking\bookingController.js =====
+const pool = require('../../db/postgres');
+
+exports.createBooking = async (req, res) => {
+  try {
+    const { propertyId, startDate, endDate } = req.body;
+    const tenantId = req.user.id;
+    
+
+    if (!propertyId || !startDate || !endDate) {
+      return res.status(400).json({ error: 'Property ID, start date, and end date are required' });
+    }
+    
+    
+    const propertyResult = await pool.query(
+      'SELECT * FROM properties WHERE id = $1',
+      [propertyId]
+    );
+    
+    if (propertyResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+    
+    const property = propertyResult.rows[0];
+    
+    if (!property.monthly_rent) {
+      return res.status(400).json({ error: 'Property does not have rent information' });
+    }
+
+    const conflictCheck = await pool.query(
+      `SELECT * FROM bookings 
+       WHERE property_id = $1 
+       AND status IN ('confirmed', 'active', 'pending')
+       AND (
+         (start_date <= $2 AND end_date >= $2) OR
+         (start_date <= $3 AND end_date >= $3) OR
+         (start_date >= $2 AND end_date <= $3)
+       )`,
+      [propertyId, startDate, endDate]
+    );
+    
+    if (conflictCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Property already booked for these dates' });
+    }
+    
+   
+    const result = await pool.query(
+      `INSERT INTO bookings (property_id, tenant_id, start_date, end_date, monthly_rent, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING *`,
+      [propertyId, tenantId, startDate, endDate, property.monthly_rent]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Create booking error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getMyBookings = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const result = await pool.query(
+      `SELECT b.*, p.title, p.address, p.city 
+       FROM bookings b
+       JOIN properties p ON b.property_id = p.id
+       WHERE b.tenant_id = $1
+       ORDER BY b.created_at DESC`,
+      [userId]
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get bookings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+exports.getLandlordBookings = async (req, res) => {
+  try {
+    const landlordId = req.user.id;
+    
+    const result = await pool.query(
+      `SELECT 
+        b.*,
+        p.title,
+        p.address,
+        p.city,
+        u.first_name,
+        u.last_name,
+        u.email,
+        u.phone
+      FROM bookings b
+      JOIN properties p ON b.property_id = p.id
+      JOIN users u ON b.tenant_id = u.id
+      WHERE p.landlord_id = $1
+      ORDER BY 
+        CASE b.status 
+          WHEN 'pending' THEN 1
+          WHEN 'confirmed' THEN 2
+          WHEN 'active' THEN 3
+          ELSE 4
+        END,
+        b.created_at DESC`,
+      [landlordId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get landlord bookings error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+
+exports.updateBookingStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const landlordId = req.user.id;
+
+ 
+    const validStatuses = ['pending', 'confirmed', 'active', 'cancelled', 'completed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+
+    const checkResult = await pool.query(
+      `SELECT b.*, p.landlord_id, b.tenant_id
+       FROM bookings b
+       JOIN properties p ON b.property_id = p.id
+       WHERE b.id = $1`,
+      [id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const booking = checkResult.rows[0];
+
+    if (booking.landlord_id !== landlordId) {
+      return res.status(403).json({ error: 'Not authorized to update this booking' });
+    }
+
+    const result = await pool.query(
+      `UPDATE bookings 
+       SET status = $1, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $2 
+       RETURNING *`,
+      [status, id]
+    );
+
+  
+    try {
+      const io = global.io;
+      if (io) {
+        io.to(`user:${booking.tenant_id}`).emit('booking_update', {
+          bookingId: id,
+          status,
+          message: `Your booking has been ${status}`,
+        });
+      }
+    } catch (err) {
+      console.log('Socket notification skipped:', err.message);
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Update booking status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+
+===== backend\src\chat\chatController.js =====
+const ChatMessage = require('../models/ChatMessage');
+const pool = require('../../db/postgres');
+
+exports.getChatHistory = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const userId = req.user.id;
+
+    console.log(` Loading chat history for room: ${roomId}, user: ${userId}`);
+
+    
+    const messages = await ChatMessage.find({ roomId })
+      .sort({ timestamp: 1 })
+      .limit(100);
+
+    console.log(`Found ${messages.length} messages`);
+    res.json(messages);
+  } catch (error) {
+    console.error('Get chat history error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getChatRooms = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    console.log(`Loading chat rooms for user: ${userId}, role: ${userRole}`);
+
+    let query;
+    if (userRole === 'tenant') {
+      
+      query = `
+        SELECT 
+          b.id as booking_id,
+          CONCAT('booking-', b.id) as room_id,
+          p.title as property_title,
+          p.landlord_id,
+          u.first_name || ' ' || u.last_name as other_user_name,
+          'landlord' as other_user_role
+        FROM bookings b
+        JOIN properties p ON b.property_id = p.id
+        JOIN users u ON p.landlord_id = u.id
+        WHERE b.tenant_id = $1 AND b.status IN ('confirmed', 'active', 'pending')
+        ORDER BY b.created_at DESC
+      `;
+    } else {
+    
+      query = `
+        SELECT 
+          b.id as booking_id,
+          CONCAT('booking-', b.id) as room_id,
+          p.title as property_title,
+          b.tenant_id,
+          u.first_name || ' ' || u.last_name as other_user_name,
+          'tenant' as other_user_role
+        FROM bookings b
+        JOIN properties p ON b.property_id = p.id
+        JOIN users u ON b.tenant_id = u.id
+        WHERE p.landlord_id = $1 AND b.status IN ('confirmed', 'active', 'pending')
+        ORDER BY b.created_at DESC
+      `;
+    }
+
+    const result = await pool.query(query, [userId]);
+
+ 
+    const roomsWithUnread = await Promise.all(
+      result.rows.map(async (room) => {
+        const unreadCount = await ChatMessage.countDocuments({
+          roomId: room.room_id,
+          senderId: { $ne: userId.toString() },
+          read: false,
+        });
+        return { ...room, unread_count: unreadCount };
+      })
+    );
+
+    console.log(` Found ${roomsWithUnread.length} chat rooms`);
+    res.json(roomsWithUnread);
+  } catch (error) {
+    console.error('Get chat rooms error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.markMessagesAsRead = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const userId = req.user.id;
+
+    console.log(` Marking messages as read in room: ${roomId} for user: ${userId}`);
+
+    const result = await ChatMessage.updateMany(
+      { 
+        roomId, 
+        senderId: { $ne: userId.toString() },
+        read: false 
+      },
+      { $set: { read: true } }
+    );
+
+    console.log(` Marked ${result.modifiedCount} messages as read`);
+    res.json({ success: true, count: result.modifiedCount });
+  } catch (error) {
+    console.error('Mark messages as read error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+
+===== backend\src\maintenance\maintenanceController.js =====
+const pool = require('../../db/postgres');
+const { publishToQueue } = require('../queue/rabbitmq');
+
+exports.createRequest = async (req, res) => {
+  try {
+    const { propertyId, title, description, priority = 'medium' } = req.body;
+    const tenantId = req.user.id;
+    
+
+    if (!propertyId || !title || !description) {
+      return res.status(400).json({ error: 'Property ID, title, and description are required' });
+    }
+    
+   
+    const bookingCheck = await pool.query(
+      `SELECT * FROM bookings 
+       WHERE property_id = $1 AND tenant_id = $2 AND status IN ('confirmed', 'active', 'pending')`,
+      [propertyId, tenantId]
+    );
+    
+    if (bookingCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'No active booking for this property' });
+    }
+    
+ 
+    const result = await pool.query(
+      `INSERT INTO maintenance_requests (property_id, tenant_id, title, description, priority, status)
+       VALUES ($1, $2, $3, $4, $5, 'open') RETURNING *`,
+      [propertyId, tenantId, title, description, priority]
+    );
+    
+    const request = result.rows[0];
+
+    const propertyResult = await pool.query('SELECT landlord_id FROM properties WHERE id = $1', [propertyId]);
+    const landlordId = propertyResult.rows[0].landlord_id;
+    
+
+    publishToQueue('maintenance-tasks', {
+      type: 'new_request',
+      requestId: request.id,
+      landlordId,
+      tenantId,
+      title,
+      priority
+    }).catch(err => console.log('Queue publish skipped:', err.message));
+    
+    res.status(201).json(request);
+  } catch (error) {
+    console.error('Create maintenance request error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updateRequestStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const userId = req.user.id;
+    
+   
+    if (!['open', 'in_progress', 'completed', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    
+ 
+    const checkResult = await pool.query(
+      `SELECT m.*, p.landlord_id 
+       FROM maintenance_requests m
+       JOIN properties p ON m.property_id = p.id
+       WHERE m.id = $1`,
+      [id]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    
+    const request = checkResult.rows[0];
+    
+    if (request.landlord_id !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    
+  
+    const result = await pool.query(
+      `UPDATE maintenance_requests 
+       SET status = $1, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $2 RETURNING *`,
+      [status, id]
+    );
+    
+  
+    try {
+      const io = global.io;
+      if (io) {
+        io.to(`user:${request.tenant_id}`).emit('maintenance_update', {
+          requestId: id,
+          status,
+          message: `Your maintenance request has been updated to: ${status}`
+        });
+      }
+    } catch (err) {
+      console.log('Socket notification skipped:', err.message);
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Update maintenance status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.getMyRequests = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    
+    let query;
+    if (role === 'tenant') {
+      query = `SELECT m.*, p.title as property_title, p.address 
+               FROM maintenance_requests m
+               JOIN properties p ON m.property_id = p.id
+               WHERE m.tenant_id = $1
+               ORDER BY m.created_at DESC`;
+    } else if (role === 'landlord') {
+
+      query = `SELECT m.*, p.title as property_title, p.address, u.first_name, u.last_name
+               FROM maintenance_requests m
+               JOIN properties p ON m.property_id = p.id
+               JOIN users u ON m.tenant_id = u.id
+               WHERE p.landlord_id = $1
+               ORDER BY 
+                 CASE m.priority
+                   WHEN 'urgent' THEN 1
+                   WHEN 'high' THEN 2
+                   WHEN 'medium' THEN 3
+                   ELSE 4
+                 END,
+                 m.created_at DESC`;
+    } else {
+      return res.status(403).json({ error: 'Invalid role' });
+    }
+    
+    const result = await pool.query(query, [userId]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get maintenance requests error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+===== backend\src\payments\paymentController.js =====
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { publishToQueue } = require('../queue/rabbitmq'); 
+const pool = require('../../db/postgres');
+exports.createPaymentIntent = async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+    
+
+    const result = await pool.query(
+      'SELECT * FROM bookings WHERE id = $1 AND tenant_id = $2',
+      [bookingId, req.user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    
+    const booking = result.rows[0];
+    const amount = booking.monthly_rent * 100; 
+    
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency: 'usd',
+      metadata: { bookingId }
+    });
+    
+    res.json({ clientSecret: paymentIntent.client_secret });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.webhookHandler = async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  
+  try {
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+    
+    if (event.type === 'payment_intent.succeeded') {
+      const paymentIntent = event.data.object;
+      const bookingId = paymentIntent.metadata.bookingId;
+      
+      await pool.query(
+        'UPDATE bookings SET status = $1, stripe_payment_id = $2 WHERE id = $3',
+        ['confirmed', paymentIntent.id, bookingId]
+      );
+      
+  
+      await publishToQueue('notifications', {
+        type: 'payment_success',
+        bookingId,
+        message: 'Payment successful! Booking confirmed.'
+      });
+    }
+    
+    res.json({ received: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+};
+
+===== backend\src\properties\propertyController.js =====
+// backend/src/properties/propertyController.js
+const pool = require('../../db/postgres'); 
+
+// Create Property (Landlord only)
+exports.createProperty = async (req, res) => {
+  try {
+    // Accept both camelCase and snake_case
+    const { 
+      title, 
+      description, 
+      address, 
+      city, 
+      monthlyRent, 
+      monthly_rent,
+      depositAmount, 
+      deposit_amount,
+      rooms,
+      status
+    } = req.body;
+    
+    const landlordId = req.user.id;
+    
+    // Use whichever format was sent
+    const rent = monthlyRent || monthly_rent;
+    const deposit = depositAmount || deposit_amount;
+    
+    // Validate required fields
+    if (!title || !rent) {
+      return res.status(400).json({ error: 'Title and monthly rent are required' });
+    }
+    
+    const result = await pool.query(
+      `INSERT INTO properties (landlord_id, title, description, address, city, monthly_rent, deposit_amount, rooms, status) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [landlordId, title, description, address, city, rent, deposit, rooms, status || 'available']
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Create property error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// Get All Properties (with filters)
+exports.getProperties = async (req, res) => {
+  try {
+    const { city, minRent, maxRent, rooms } = req.query;
+    
+    let query = 'SELECT * FROM properties WHERE status = $1';
+    const params = ['available'];
+    let paramCount = 1;
+    
+    if (city) {
+      paramCount++;
+      query += ` AND city ILIKE $${paramCount}`;
+      params.push(`%${city}%`);
+    }
+    
+    if (minRent) {
+      paramCount++;
+      query += ` AND monthly_rent >= $${paramCount}`;
+      params.push(minRent);
+    }
+    
+    if (maxRent) {
+      paramCount++;
+      query += ` AND monthly_rent <= $${paramCount}`;
+      params.push(maxRent);
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get properties error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// Get Property by ID
+exports.getPropertyById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM properties WHERE id = $1', [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Get property error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+===== backend\src\middleware\auth.js =====
+const jwt = require('jsonwebtoken');
+
+
+exports.authenticateToken = (req, res, next) => {
+ 
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; 
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+  
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      console.error('JWT verification error:', err);
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    
+    req.user = user;
+    next();
+  });
+};
+
+
+exports.authorizeRole = (...roles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ 
+        error: 'Access denied. Insufficient permissions.',
+        requiredRole: roles,
+        userRole: req.user.role
+      });
+    }
+    
+    next();
+  };
+};
+
+
+exports.requireVerified = (req, res, next) => {
+  if (!req.user.verified) {
+    return res.status(403).json({ 
+      error: 'Email verification required',
+      message: 'Please verify your email before accessing this resource'
+    });
+  }
+  next();
+};
+
+===== backend\src\middleware\socketAuth.js =====
+const jwt = require('jsonwebtoken');
+
+exports.authenticateSocket = (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+      return next(new Error('Authentication error: No token provided'));
+    }
+    
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+      if (err) {
+        return next(new Error('Authentication error: Invalid token'));
+      }
+      
+  
+      socket.user = decoded;
+      next();
+    });
+  } catch (error) {
+    next(new Error('Authentication error'));
+  }
+};
+
+===== backend\src\models\ChatMessage.js =====
+const mongoose = require('mongoose');
+
+const chatMessageSchema = new mongoose.Schema({
+  roomId: {
+    type: String,
+    required: true,
+    index: true
+  },
+  senderId: {
+    type: String,
+    required: true,
+    index: true
+  },
+  senderName: {
+    type: String,
+    required: true
+  },
+  senderEmail: {
+    type: String,
+    default: ''
+  },
+  message: {
+    type: String,
+    required: true,
+    trim: true,
+    maxlength: 5000
+  },
+  messageType: {
+    type: String,
+    enum: ['text', 'image', 'file', 'system'],
+    default: 'text'
+  },
+  read: {
+    type: Boolean,
+    default: false
+  },
+  status: {
+    type: String,
+    enum: ['sent', 'delivered', 'read'],
+    default: 'sent'
+  },
+  timestamp: {
+    type: Date,
+    default: Date.now,
+    index: true
+  },
+  edited: {
+    type: Boolean,
+    default: false
+  },
+  editedAt: {
+    type: Date
+  },
+  deletedBy: [{
+    type: String
+  }]
+}, {
+  timestamps: true
+});
+
+
+chatMessageSchema.index({ roomId: 1, timestamp: -1 });
+chatMessageSchema.index({ senderId: 1, timestamp: -1 });
+
+
+chatMessageSchema.methods.toClientFormat = function() {
+  return {
+    _id: this._id,
+    roomId: this.roomId,
+    senderId: this.senderId,
+    senderName: this.senderName,
+    message: this.message,
+    messageType: this.messageType,
+    read: this.read,
+    timestamp: this.timestamp,
+    edited: this.edited
+  };
+};
+
+
+module.exports = mongoose.models.ChatMessage || mongoose.model('ChatMessage', chatMessageSchema);
+
+===== backend\src\notifications\notificationService.js =====
+const pool = require('../../db/postgres');
+
+exports.sendNotification = async (userId, notification) => {
+  try {
+    console.log(`Notification to user ${userId}:`, notification.message);
+    
+   
+    return { success: true, userId, notification };
+  } catch (error) {
+    console.error('Notification error:', error.message);
+    return { success: false, error: error.message };
+  }
+};
+
+exports.notifyBookingConfirmed = async (bookingId, tenantId, landlordId) => {
+  try {
+    const message = `Your booking #${bookingId} has been confirmed!`;
+    
+
+    await exports.sendNotification(tenantId, {
+      type: 'booking_confirmed',
+      message,
+      bookingId
+    });
+    
+
+    await exports.sendNotification(landlordId, {
+      type: 'new_booking',
+      message: `New booking received: #${bookingId}`,
+      bookingId
+    });
+    
+    return { success: true };
+  } catch (error) {
+    console.error(' Error sending booking notification:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+exports.notifyPaymentSuccess = async (bookingId, userId, amount) => {
+  try {
+    await exports.sendNotification(userId, {
+      type: 'payment_success',
+      message: `Payment of $${amount} processed successfully for booking #${bookingId}`,
+      bookingId,
+      amount
+    });
+    
+    return { success: true };
+  } catch (error) {
+    console.error(' Error sending payment notification:', error);
+    return { success: false };
+  }
+};
+
+exports.notifyMaintenanceRequest = async (requestId, landlordId, priority) => {
+  try {
+    await exports.sendNotification(landlordId, {
+      type: 'maintenance_request',
+      message: `New ${priority} priority maintenance request #${requestId}`,
+      requestId,
+      priority
+    });
+    
+    return { success: true };
+  } catch (error) {
+    console.error(' Error sending maintenance notification:', error);
+    return { success: false };
+  }
+};
+
+===== backend\src\queue\rabbitmq.js =====
+const amqp = require('amqplib');
+
+let channel = null;
+let connection = null;
+
+exports.connect = async () => {
+  try {
+    if (connection) {
+      console.log('RabbitMQ already connected');
+      return;
+    }
+    
+    const rabbitmqUrl = process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672';
+    connection = await amqp.connect(rabbitmqUrl);
+    channel = await connection.createChannel();
+    
+
+    await channel.assertQueue('payment-processing', { durable: true });
+    await channel.assertQueue('notifications', { durable: true });
+    await channel.assertQueue('maintenance-tasks', { durable: true });
+    await channel.assertQueue('email-queue', { durable: true });
+    
+    console.log('RabbitMQ connected and queues created');
+    
+    connection.on('error', (err) => {
+      console.error('RabbitMQ connection error:', err);
+    });
+    
+    connection.on('close', () => {
+      console.log('RabbitMQ connection closed');
+      connection = null;
+      channel = null;
+    });
+    
+  } catch (error) {
+    console.error('Failed to connect to RabbitMQ:', error.message);
+    console.log('Continuing without RabbitMQ...');
+  }
+};
+
+exports.publishToQueue = async (queueName, message) => {
+  try {
+    if (!channel) {
+      console.warn(`RabbitMQ not connected, skipping message to ${queueName}`);
+      return false;
+    }
+    
+    channel.sendToQueue(
+      queueName,
+      Buffer.from(JSON.stringify(message)),
+      { persistent: true }
+    );
+    
+    console.log(`Message sent to queue: ${queueName}`);
+    return true;
+  } catch (error) {
+    console.error('Error publishing to queue:', error.message);
+    return false;
+  }
+};
+
+exports.consumeQueue = async (queueName, callback) => {
+  try {
+    if (!channel) {
+      console.warn(`RabbitMQ not connected, cannot consume ${queueName}`);
+      return;
+    }
+    
+    await channel.consume(queueName, async (msg) => {
+      if (msg) {
+        try {
+          const content = JSON.parse(msg.content.toString());
+          await callback(content);
+          channel.ack(msg);
+        } catch (error) {
+          console.error('Error processing message:', error);
+          channel.nack(msg, false, false); 
+        }
+      }
+    });
+    
+    console.log(`ðŸ‘‚ Listening to queue: ${queueName}`);
+  } catch (error) {
+    console.error(`Error consuming queue ${queueName}:`, error.message);
+  }
+};
+
+exports.getChannel = () => channel;
+exports.getConnection = () => connection;
+
+===== backend\src\utils\redis.js =====
+const Redis = require('ioredis');
+
+let redis = null;
+
+const connectRedis = () => {
+  try {
+    redis = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: process.env.REDIS_PORT || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000);
+        return delay;
+      }
+    });
+    
+    redis.on('connect', () => {
+      console.log(' Redis connected');
+    });
+    
+    redis.on('error', (err) => {
+      console.error(' Redis error:', err.message);
+    });
+    
+    return redis;
+  } catch (error) {
+    console.error('Redis connection failed:', error.message);
+    return null;
+  }
+};
+
+const getRedis = () => {
+  if (!redis) {
+    redis = connectRedis();
+  }
+  return redis;
+};
+
+module.exports = { connectRedis, getRedis };
+
+===== backend\src\utils\validation.js =====
+
+===== backend\src\workers\maintenanceWorker.js =====
+const { consumeQueue } = require('../queue/rabbitmq');
+const pool = require('../db/postgres');
+
+const startMaintenanceWorker = async () => {
+  await consumeQueue('maintenance-tasks', async (message) => {
+    console.log('Processing maintenance task:', message);
+    
+    if (message.type === 'new_request') {
+      // Send notification to landlord
+      const io = global.io; // Assuming io is globally available
+      io.to(`user:${message.landlordId}`).emit('notification', {
+        type: 'maintenance_request',
+        title: 'New Maintenance Request',
+        message: `New ${message.priority} priority request: ${message.title}`,
+        requestId: message.requestId
+      });
+      
+      // Log the task
+      console.log(`Notified landlord ${message.landlordId} about request ${message.requestId}`);
+    }
+  });
+};
+
+module.exports = { startMaintenanceWorker };
+
+===== backend\src\workers\paymentWorker.js =====
+const { connect, consumeQueue } = require('../queue/rabbitmq');
+
+const startPaymentWorker = async () => {
+  await connect(); // <-- ensure connection
+  await consumeQueue('payment-processing', async (message) => {
+    console.log('Processing payment:', message);
+    await sendNotification(message.userId, { type: 'payment_update', message: `Payment of $${message.amount} processed successfully` });
+  });
+};
+
+startPaymentWorker();
+
+
+===== backend\src\routes\authRoutes.js =====
+const express = require('express');
+const router = express.Router();
+const authController = require('../auth/authController');
+const { authenticateToken } = require('../middleware/auth');
+
+
+router.post('/register', authController.register);
+router.post('/login', authController.login);
+
+router.get('/profile', authenticateToken, authController.getProfile);
+router.post('/logout', authenticateToken, authController.logout);
+
+module.exports = router;
+
+===== backend\src\routes\bookingRoutes.js =====
+const express = require('express');
+const router = express.Router();
+const { 
+  createBooking, 
+  getMyBookings,
+  getLandlordBookings,
+  updateBookingStatus
+} = require('../booking/bookingController');
+const { authenticateToken, authorizeRole } = require('../middleware/auth');
+
+
+router.post('/', authenticateToken, authorizeRole('tenant'), createBooking);
+router.get(
+  '/my-bookings',
+  authenticateToken,
+  authorizeRole('tenant'),
+  getMyBookings
+);
+
+
+router.get('/landlord/bookings', authenticateToken, authorizeRole('landlord'), getLandlordBookings);
+router.patch('/:id/status', authenticateToken, authorizeRole('landlord'), updateBookingStatus);
+
+module.exports = router;
+
+===== backend\src\routes\chatRoutes.js =====
+
+const express = require('express');
+const router = express.Router();
+const chatController = require('../chat/chatController');
+const { authenticateToken } = require('../middleware/auth');
+
+router.use(authenticateToken);
+
+router.get('/:roomId/history', chatController.getChatHistory);
+
+router.get('/rooms', chatController.getChatRooms);
+
+router.put('/:roomId/read', chatController.markMessagesAsRead);
+
+module.exports = router;
+
+===== backend\src\routes\maintenanceRoutes.js =====
+const express = require('express');
+const router = express.Router();
+const { authenticateToken } = require('../middleware/auth');
+
+
+let createRequest, updateRequestStatus, getMyRequests;
+
+try {
+  const controller = require('../maintenance/maintenanceController');
+  createRequest = controller.createRequest;
+  updateRequestStatus = controller.updateRequestStatus;
+  getMyRequests = controller.getMyRequests;
+} catch (error) {
+  console.log('Maintenance controller not found, using placeholder routes');
+}
+
+
+if (createRequest) {
+  router.post('/', authenticateToken, createRequest);
+} else {
+  router.post('/', authenticateToken, (req, res) => {
+    res.status(501).json({ error: 'Maintenance creation not implemented' });
+  });
+}
+
+if (getMyRequests) {
+  router.get('/', authenticateToken, getMyRequests);
+} else {
+  router.get('/', authenticateToken, (req, res) => {
+    res.json([]);
+  });
+}
+
+
+if (updateRequestStatus) {
+  router.patch('/:id', authenticateToken, updateRequestStatus);
+} else {
+  router.patch('/:id', authenticateToken, (req, res) => {
+    res.status(501).json({ error: 'Maintenance update not implemented' });
+  });
+}
+
+
+router.get('/status', (req, res) => {
+  res.json({ 
+    status: 'ok',
+    message: 'Maintenance system operational',
+    timestamp: new Date().toISOString()
+  });
+});
+
+module.exports = router;
+
+===== backend\src\routes\paymentRoutes.js =====
+const express = require('express');
+const router = express.Router();
+const { createPaymentIntent, webhookHandler } = require('../payments/paymentController');
+const { authenticateToken } = require('../middleware/auth');
+
+
+router.post('/create-intent', authenticateToken, createPaymentIntent);
+
+
+router.post('/webhook', express.raw({ type: 'application/json' }), webhookHandler);
+
+module.exports = router;
+
+
+===== backend\src\routes\propertyRoutes.js =====
+const express = require('express');
+const router = express.Router();
+const { createProperty, getProperties, getPropertyById } = require('../properties/propertyController');
+const { authenticateToken, authorizeRole } = require('../middleware/auth');
+
+
+router.post('/', authenticateToken, authorizeRole('landlord'), createProperty);
+
+
+router.get('/', getProperties);
+
+
+router.get('/:id', getPropertyById);
+
+module.exports = router;
+
+
+===== docker-compose.yml =====
+
+
+services:
+  # Databases
+  postgres:
+    image: postgres:15
+    container_name: roomconnect-postgres
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: roomconnect
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: roomconnect_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roomconnect"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - roomconnect-network
+
+  mongodb:
+    image: mongo:6
+    container_name: roomconnect-mongodb
+    expose:
+      - "27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret123
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - roomconnect-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: roomconnect-redis
+    expose:
+      - "6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - roomconnect-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: roomconnect-rabbitmq
+    ports:
+      - "15672:15672"  # Management UI
+    expose:
+      - "5672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - roomconnect-network
+
+  # Backend instances
+  backend-1:
+    build: ./backend
+    container_name: roomconnect-backend-1
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-1
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  backend-2:
+    build: ./backend
+    container_name: roomconnect-backend-2
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-2
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  backend-3:
+    build: ./backend
+    container_name: roomconnect-backend-3
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-3
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  # Frontend
+  frontend:
+    build: ./frontend
+    container_name: roomconnect-frontend
+    expose:
+      - "80"
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  # Nginx Load Balancer
+  nginx:
+    build: ./nginx
+    container_name: roomconnect-nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
+      - frontend
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  roomconnect-network:
+    driver: bridge
+
+===== backend\dockerfile =====
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Don't run as root
+RUN addgroup -g 1001 nodejs && \
+    adduser -S nodejs -u 1001 && \
+    chown -R nodejs:nodejs /app
+
+USER nodejs
+
+EXPOSE 3001
+
+CMD ["npm", "start"]
+
+===== frontend\dockerfile =====
+# Build stage
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# Production stage
+FROM nginx:alpine
+
+# Copy built files
+COPY --from=builder /app/build /usr/share/nginx/html
+
+# Copy nginx config
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+
+===== nginx\nginx.conf =====
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream backend_servers {
+        least_conn;
+        server backend-1:3001 max_fails=3 fail_timeout=30s;
+        server backend-2:3001 max_fails=3 fail_timeout=30s;
+        server backend-3:3001 max_fails=3 fail_timeout=30s;
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        client_max_body_size 10M;
+
+        # Proxy to React app
+        location / {
+            proxy_pass http://frontend:80;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        # API Routes
+        location /api/ {
+            proxy_pass http://backend_servers;
+            proxy_http_version 1.1;
+            
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+        
+        # WebSocket
+        location /socket.io/ {
+            proxy_pass http://backend_servers;
+            proxy_http_version 1.1;
+            
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            
+            proxy_buffering off;
+            
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+        
+        # Health check
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+
+===== frontend\package.json =====
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@reduxjs/toolkit": "^2.11.2",
+    "@stripe/react-stripe-js": "^5.4.1",
+    "@stripe/stripe-js": "^8.6.1",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/user-event": "^13.5.0",
+    "axios": "^1.13.2",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-redux": "^9.2.0",
+    "react-router-dom": "^7.12.0",
+    "react-scripts": "5.0.1",
+    "socket.io-client": "^4.8.3",
+    "web-vitals": "^2.1.4"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.1",
+    "autoprefixer": "^10.4.23",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.19"
+  }
+}
+
+
+===== frontend\src\App.js =====
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Provider, useSelector } from 'react-redux';
+import { store } from './redux/store';
+import Login from './Pages/Login';
+import Register from './Pages/Register';
+import PropertyList from './Pages/PropertList';
+import PropertyDetail from './Pages/PropertyDetail';
+import CreateProperty from './Pages/CreateProperty';
+import MyBookings from './Pages/MyBookings';
+import MaintenanceRequests from './Pages/MaintenanceRequests';
+import ChatPage from './Pages/ChatPage';
+import Dashboard from './Pages/Dashboard';
+import Navbar from './componenets/NavBar';
+import LandlordBookings from './Pages/LandlordBookings';
+import ChatList from './Pages/ChatList';
+
+
+const PrivateRoute = ({ children }) => {
+  const { token } = useSelector((state) => state.auth);
+  return token ? children : <Navigate to="/login" />;
+};
+
+function AppRoutes() {
+  return (
+    <BrowserRouter>
+      <Navbar />
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
+        <Route path="/" element={<PropertyList />} />
+        <Route path="/properties/:id" element={<PropertyDetail />} />
+        
+        <Route
+          path="/dashboard"
+          element={
+            <PrivateRoute>
+              <Dashboard />
+            </PrivateRoute>
+          }
+        />
+        <Route
+  path="/landlord/bookings"
+  element={
+    <PrivateRoute>
+      <LandlordBookings />
+    </PrivateRoute>
+  }
+/>
+        <Route
+          path="/properties/create"
+          element={
+            <PrivateRoute>
+              <CreateProperty />
+            </PrivateRoute>
+          }
+        />
+        <Route
+  path="/messages"
+  element={
+    <PrivateRoute>
+      <ChatList />
+    </PrivateRoute>
+  }
+/>
+<Route
+  path="/chat/:roomId"
+  element={
+    <PrivateRoute>
+      <ChatPage />
+    </PrivateRoute>
+  }
+/>
+
+        <Route
+          path="/bookings"
+          element={
+            <PrivateRoute>
+              <MyBookings />
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/maintenance"
+          element={
+            <PrivateRoute>
+              <MaintenanceRequests />
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/chat/:roomId"
+          element={
+            <PrivateRoute>
+              <ChatPage />
+            </PrivateRoute>
+          }
+        />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+function App() {
+  return (
+    <Provider store={store}>
+      <AppRoutes />
+    </Provider>
+  );
+}
+
+export default App;
+
+===== frontend\src\api\axios.js =====
+import axios from 'axios';
+
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+
+const api = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+
+api.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+
+
+===== frontend\src\hooks\useSocket.js =====
+import { useEffect, useState } from 'react';
+import { io } from 'socket.io-client';
+
+export const useSocket = () => {
+  const [socket, setSocket] = useState(null);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+
+    const newSocket = io('http://localhost:3001', {
+      auth: { token },
+    });
+
+    newSocket.on('connect', () => {
+      console.log('Socket connected');
+    });
+
+    newSocket.on('disconnect', () => {
+      console.log('Socket disconnected');
+    });
+
+    setSocket(newSocket);
+
+    return () => {
+      newSocket.close();
+    };
+  }, []);
+
+  return socket;
+};
+
+
+===== frontend\src\redux\store.js =====
+import { configureStore } from '@reduxjs/toolkit';
+import authReducer from './slices/authSlice';
+import propertiesReducer from './slices/propertiesSlice';
+import bookingsReducer from './slices/bookingsSlice';
+import maintenanceReducer from './slices/maintenanceSlice';
+import chatReducer from './slices/chatSlice';
+
+export const store = configureStore({
+  reducer: {
+    auth: authReducer,
+    properties: propertiesReducer,
+    bookings: bookingsReducer,
+    maintenance: maintenanceReducer,
+    chat: chatReducer,
+  },
+});
+
+

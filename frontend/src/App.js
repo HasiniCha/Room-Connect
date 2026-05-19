@@ -14,7 +14,6 @@ import Navbar from './componenets/NavBar';
 import LandlordBookings from './Pages/LandlordBookings';
 import ChatList from './Pages/ChatList';
 
-
 const PrivateRoute = ({ children }) => {
   const { token } = useSelector((state) => state.auth);
   return token ? children : <Navigate to="/login" />;
@@ -28,8 +27,18 @@ function AppRoutes() {
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
         <Route path="/" element={<PropertyList />} />
+
+        {/* IMPORTANT: /properties/create must come BEFORE /properties/:id */}
+        <Route
+          path="/properties/create"
+          element={
+            <PrivateRoute>
+              <CreateProperty />
+            </PrivateRoute>
+          }
+        />
         <Route path="/properties/:id" element={<PropertyDetail />} />
-        
+
         <Route
           path="/dashboard"
           element={
@@ -39,38 +48,29 @@ function AppRoutes() {
           }
         />
         <Route
-  path="/landlord/bookings"
-  element={
-    <PrivateRoute>
-      <LandlordBookings />
-    </PrivateRoute>
-  }
-/>
-        <Route
-          path="/properties/create"
+          path="/landlord/bookings"
           element={
             <PrivateRoute>
-              <CreateProperty />
+              <LandlordBookings />
             </PrivateRoute>
           }
         />
         <Route
-  path="/messages"
-  element={
-    <PrivateRoute>
-      <ChatList />
-    </PrivateRoute>
-  }
-/>
-<Route
-  path="/chat/:roomId"
-  element={
-    <PrivateRoute>
-      <ChatPage />
-    </PrivateRoute>
-  }
-/>
-
+          path="/messages"
+          element={
+            <PrivateRoute>
+              <ChatList />
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/chat/:roomId"
+          element={
+            <PrivateRoute>
+              <ChatPage />
+            </PrivateRoute>
+          }
+        />
         <Route
           path="/bookings"
           element={
@@ -84,14 +84,6 @@ function AppRoutes() {
           element={
             <PrivateRoute>
               <MaintenanceRequests />
-            </PrivateRoute>
-          }
-        />
-        <Route
-          path="/chat/:roomId"
-          element={
-            <PrivateRoute>
-              <ChatPage />
             </PrivateRoute>
           }
         />

@@ -1,4 +1,4 @@
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
@@ -10,7 +10,7 @@ CREATE TABLE users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE properties (
+CREATE TABLE IF NOT EXISTS properties (
     id SERIAL PRIMARY KEY,
     landlord_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     title VARCHAR(255) NOT NULL,
@@ -18,13 +18,13 @@ CREATE TABLE properties (
     address TEXT NOT NULL,
     city VARCHAR(100) NOT NULL,
     monthly_rent DECIMAL(10,2) NOT NULL,
-    deposit_amount DECIMAL(10,2) NOT NULL,
-    rooms INTEGER NOT NULL,
+    deposit_amount DECIMAL(10,2),
+    rooms INTEGER,
     status VARCHAR(20) DEFAULT 'available',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE bookings (
+CREATE TABLE IF NOT EXISTS bookings (
     id SERIAL PRIMARY KEY,
     property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
     tenant_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -33,10 +33,11 @@ CREATE TABLE bookings (
     monthly_rent DECIMAL(10,2) NOT NULL,
     status VARCHAR(20) DEFAULT 'pending',
     stripe_payment_id VARCHAR(255),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE maintenance_requests (
+CREATE TABLE IF NOT EXISTS maintenance_requests (
     id SERIAL PRIMARY KEY,
     property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
     tenant_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -48,6 +49,6 @@ CREATE TABLE maintenance_requests (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_properties_city ON properties(city);
-CREATE INDEX idx_bookings_tenant ON bookings(tenant_id);
-CREATE INDEX idx_maintenance_status ON maintenance_requests(status);
+CREATE INDEX IF NOT EXISTS idx_properties_city ON properties(city);
+CREATE INDEX IF NOT EXISTS idx_bookings_tenant ON bookings(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_maintenance_status ON maintenance_requests(status);

@@ -12,7 +12,12 @@ const chatSlice = createSlice({
       if (!state.messages[roomId]) {
         state.messages[roomId] = [];
       }
-      state.messages[roomId].push(message);
+      // Prevent duplicate messages by _id
+      const exists = message._id &&
+        state.messages[roomId].some((m) => m._id === message._id);
+      if (!exists) {
+        state.messages[roomId].push(message);
+      }
     },
     setActiveRoom: (state, action) => {
       state.activeRoom = action.payload;

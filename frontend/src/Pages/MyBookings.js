@@ -7,16 +7,37 @@ const MyBookings = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const { list, loading, error } = useSelector((state) => state.bookings);
+  const { user } = useSelector((state) => state.auth);
 
   useEffect(() => {
-    dispatch(fetchMyBookings());
-  }, [dispatch]);
+    if (user?.role === 'tenant') {
+      dispatch(fetchMyBookings());
+    }
+  }, [dispatch, user]);
+
+  // Landlords should use Manage Bookings instead
+  if (user?.role === 'landlord') {
+    return (
+      <div className="container mx-auto px-4 py-8">
+        <div className="bg-white p-8 rounded-lg shadow-md text-center">
+          <h2 className="text-2xl font-bold mb-4">Manage Your Properties</h2>
+          <p className="text-gray-600 mb-6">
+            As a landlord, you can view and manage bookings from tenants in the Manage Bookings section.
+          </p>
+          <button
+            onClick={() => navigate('/landlord/bookings')}
+            className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700"
+          >
+            Go to Manage Bookings
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const formatDate = (dateString) => {
     return new Date(dateString).toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
+      year: 'numeric', month: 'long', day: 'numeric',
     });
   };
 
@@ -28,22 +49,18 @@ const MyBookings = () => {
     );
   }
 
-  if (error) {
-    return (
-      <div className="container mx-auto px-4 py-8">
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
-          Error loading bookings: {error}
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="container mx-auto px-4 py-8">
       <h1 className="text-3xl font-bold mb-8">My Bookings</h1>
       {list.length === 0 ? (
         <div className="bg-white p-8 rounded-lg shadow-md text-center">
-          <p className="text-gray-600">No bookings found</p>
+          <p className="text-gray-600 mb-4">No bookings yet.</p>
+          <button
+            onClick={() => navigate('/')}
+            className="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700"
+          >
+            Browse Properties
+          </button>
         </div>
       ) : (
         <div className="space-y-4">
@@ -54,21 +71,14 @@ const MyBookings = () => {
                   <h3 className="text-xl font-semibold mb-2">{booking.title}</h3>
                   <p className="text-gray-600">{booking.address}, {booking.city}</p>
                 </div>
-                <span
-                  className={`px-4 py-2 rounded text-white ${
-                    booking.status === 'confirmed'
-                      ? 'bg-green-500'
-                      : booking.status === 'pending'
-                      ? 'bg-yellow-500'
-                      : booking.status === 'active'
-                      ? 'bg-blue-500'
-                      : 'bg-gray-500'
-                  }`}
-                >
+                <span className={`px-4 py-2 rounded text-white ${
+                  booking.status === 'confirmed' ? 'bg-green-500' :
+                  booking.status === 'pending' ? 'bg-yellow-500' :
+                  booking.status === 'active' ? 'bg-blue-500' : 'bg-gray-500'
+                }`}>
                   {booking.status}
                 </span>
               </div>
-              
               <div className="grid grid-cols-3 gap-4 text-sm mb-4">
                 <div>
                   <p className="text-gray-600">Start Date</p>
@@ -85,16 +95,11 @@ const MyBookings = () => {
                   </p>
                 </div>
               </div>
-
               {(booking.status === 'confirmed' || booking.status === 'active') && (
                 <button
                   onClick={() => navigate(`/chat/booking-${booking.id}`, {
                     state: {
-                      otherUser: {
-                        firstName: 'Landlord',
-                        lastName: '',
-                        role: 'landlord'
-                      },
+                      otherUser: { firstName: 'Landlord', lastName: '', role: 'landlord' },
                       propertyTitle: booking.title
                     }
                   })}

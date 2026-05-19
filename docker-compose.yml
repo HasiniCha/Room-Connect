@@ -1,38 +1,194 @@
-version: '3.8'
+
+
 services:
+  # Databases
   postgres:
     image: postgres:15
     container_name: roomconnect-postgres
-    ports:
-      - "5432:5432"
+    expose:
+      - "5432"
     environment:
       POSTGRES_USER: roomconnect
       POSTGRES_PASSWORD: secret
       POSTGRES_DB: roomconnect_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roomconnect"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - roomconnect-network
+
   mongodb:
     image: mongo:6
-    ports:
-      - "27017:27017"
-      
+    container_name: roomconnect-mongodb
+    expose:
+      - "27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret123
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - roomconnect-network
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    container_name: roomconnect-redis
+    expose:
+      - "6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - roomconnect-network
 
   rabbitmq:
     image: rabbitmq:3-management
+    container_name: roomconnect-rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "15672:15672"  # Management UI
+    expose:
+      - "5672"
     environment:
       RABBITMQ_DEFAULT_USER: admin
       RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - roomconnect-network
+
+  # Backend instances
+  backend-1:
+    build: ./backend
+    container_name: roomconnect-backend-1
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-1
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://guest:guest@movie-night-rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  backend-2:
+    build: ./backend
+    container_name: roomconnect-backend-2
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-2
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://guest:guest@movie-night-rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  backend-3:
+    build: ./backend
+    container_name: roomconnect-backend-3
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      INSTANCE_ID: backend-3
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: roomconnect_db
+      DB_USER: roomconnect
+      DB_PASSWORD: secret
+      MONGODB_URI: mongodb://admin:secret123@mongodb:27017/roomconnect?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://guest:guest@movie-night-rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  # Frontend
+  frontend:
+    build: ./frontend
+    container_name: roomconnect-frontend
+    expose:
+      - "80"
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
+
+  # Nginx Load Balancer
+  nginx:
+    build: ./nginx
+    container_name: roomconnect-nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
+      - frontend
+    networks:
+      - roomconnect-network
+    restart: unless-stopped
 
 volumes:
   postgres_data:
   mongo_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  roomconnect-network:
+    driver: bridge
